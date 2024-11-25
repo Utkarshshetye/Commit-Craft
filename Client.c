@@ -71,7 +71,6 @@ void get_values(redisContext *context){
 // }
 
 // void signature_define(){
-
     
 //     // redisReply * reply1 = redisCommand(rc,"HGET sign name");
 //     // redisReply * reply2 = redisCommand(rc,"HGET sign email");
