@@ -1,0 +1,5 @@
+Warning: Failed to lookup parent commit: object not found - no match for id (488b8518ffffff4885c0740b48c78528ffffff01)
+Initialized existing Git repository in /home/utkarsh/Resume Verification Docs/Commit-Craft-main/.git
+Using hardcoded commit message for automated testing
+No parent tree available; assuming initial commit.
+Files changed: 1

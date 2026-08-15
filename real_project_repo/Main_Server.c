@@ -20,13 +20,6 @@
 #endif
 #define MAX_CLIENTS 128
 
-#define MAX_MANIFEST_ENTRIES 1024
-
-typedef struct {
-    char file_name[256];
-    char hash[HASH_SIZE + 1];
-} ManifestEntry;
-
 typedef struct ClientNode {
     int client_fd;
     struct ClientNode *next;
@@ -35,7 +28,6 @@ typedef struct ClientNode {
 ClientNode *queue_front = NULL, *queue_rear = NULL;
 pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
-pthread_mutex_t branch_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void enqueue_client(int client_fd) {
     ClientNode *new_node = (ClientNode *)malloc(sizeof(ClientNode));
@@ -190,133 +182,102 @@ void handle_pull(int client_fd, const char *branch) {
     free(content);
 }
 
-void handle_push(int client_fd, const char *branch, int num_files, const char *parent_hash) {
-    pthread_mutex_lock(&branch_lock);
-
-    char current_manifest_hash[HASH_SIZE + 1];
-    read_branch_head(branch, current_manifest_hash);
-
-    // FAST-FORWARD CONFLICT REJECTION
-    // If the branch has a history, the client MUST provide the correct parent_hash
-    if (strlen(current_manifest_hash) > 0 && 
-        strcmp(current_manifest_hash, parent_hash) != 0) {
-        
-        send(client_fd, "ERROR: Conflict! Branch diverged. Please PULL first.\n", 53, 0);
-        pthread_mutex_unlock(&branch_lock);
-        return;
-    }
-
-    ManifestEntry entries[MAX_MANIFEST_ENTRIES];
-    int num_entries = 0;
-
-    if (strlen(current_manifest_hash) > 0) {
-        char old_manifest_path[256];
-        snprintf(old_manifest_path, sizeof(old_manifest_path), ".git/objects/%.2s/%.38s", current_manifest_hash, current_manifest_hash + 2);
-        FILE *old_mf = fopen(old_manifest_path, "r");
-        if (old_mf) {
-            char line[512];
-            while (fgets(line, sizeof(line), old_mf)) {
-                if (num_entries >= MAX_MANIFEST_ENTRIES) break;
-                char entry_name[256];
-                char entry_hash[HASH_SIZE + 1];
-                if (sscanf(line, "%255s %40s", entry_name, entry_hash) == 2) {
-                    strncpy(entries[num_entries].file_name, entry_name, 255);
-                    strncpy(entries[num_entries].hash, entry_hash, HASH_SIZE);
-                    entries[num_entries].hash[HASH_SIZE] = '\0';
-                    num_entries++;
-                }
-            }
-            fclose(old_mf);
-        }
-    }
-
+void handle_push(int client_fd, const char *branch, const char *file_name, size_t file_size, char *initial_data, size_t initial_len) {
+    char hash[HASH_SIZE + 1];
     char *buffer = malloc(BUFFER_SIZE);
     if (!buffer) {
-        perror("Failed to allocate buffer");
-        pthread_mutex_unlock(&branch_lock);
+        perror("Failed to allocate buffer in handle_push");
+        return;
+    }
+	size_t total_received = 0;
+    
+    // Create a temporary file to store the received content
+    char temp_path[] = ".git/temp_object_XXXXXX";
+    int temp_fd = mkstemp(temp_path);
+
+    if (temp_fd == -1) {
+        perror("Error creating temporary file");
+        send(client_fd, "ERROR: Could not create temporary file\n", 39, 0);
+        free(buffer);
         return;
     }
 
-    for (int f = 0; f < num_files; f++) {
-        char file_header[256];
-        recv(client_fd, file_header, 256, MSG_WAITALL); // Exactly 256 bytes
-
-        size_t file_size;
-        char file_name[256];
-        sscanf(file_header, "%lu %s", &file_size, file_name);
-
-        char temp_path[] = ".git/temp_object_XXXXXX";
-        int temp_fd = mkstemp(temp_path);
-
-        size_t total_received = 0;
-        while (total_received < file_size) {
-            size_t to_recv = (file_size - total_received) > BUFFER_SIZE ? BUFFER_SIZE : (file_size - total_received);
-            ssize_t bytes_received = recv(client_fd, buffer, to_recv, 0);
-            if (bytes_received <= 0) break;
-            write(temp_fd, buffer, bytes_received);
-            total_received += bytes_received;
+    printf("Main_Server: Expecting %lu bytes for file %s. Initial data: %lu bytes\n", file_size, file_name, initial_len);
+    fflush(stdout);
+    if (initial_len > 0) {
+        if (write(temp_fd, initial_data, initial_len) != (ssize_t)initial_len) {
+            perror("Error writing initial data to temporary file");
+            close(temp_fd);
+            unlink(temp_path);
+            send(client_fd, "ERROR: Could not save file\n", 27, 0);
+            free(buffer);
+            return;
         }
-        close(temp_fd);
+        total_received += initial_len;
+    }
 
-        char hash[HASH_SIZE + 1];
-        compute_sha1(temp_path, file_size, hash);
-
-        char object_dir[256];
-        snprintf(object_dir, sizeof(object_dir), ".git/objects/%.2s", hash);
-        mkdir(object_dir, 0755);
-
-        char object_path[256];
-        snprintf(object_path, sizeof(object_path), ".git/objects/%.2s/%.38s", hash, hash + 2);
-        rename(temp_path, object_path);
-
-        int found = 0;
-        for (int i = 0; i < num_entries; i++) {
-            if (strcmp(entries[i].file_name, file_name) == 0) {
-                strncpy(entries[i].hash, hash, HASH_SIZE);
-                entries[i].hash[HASH_SIZE] = '\0';
-                found = 1;
-                break;
-            }
+    size_t last_print = 0;
+    while (total_received < file_size) {
+        ssize_t bytes_received = recv(client_fd, buffer, BUFFER_SIZE, 0);
+        if (bytes_received <= 0) {
+            perror("Error receiving file data");
+            printf("Main_Server: Connection lost after %lu / %lu bytes\n", total_received, file_size);
+            fflush(stdout);
+            close(temp_fd);
+            unlink(temp_path);
+            free(buffer);
+            return;
         }
-        if (!found && num_entries < MAX_MANIFEST_ENTRIES) {
-            strncpy(entries[num_entries].file_name, file_name, 255);
-            strncpy(entries[num_entries].hash, hash, HASH_SIZE);
-            entries[num_entries].hash[HASH_SIZE] = '\0';
-            num_entries++;
+
+        if (write(temp_fd, buffer, bytes_received) != bytes_received) {
+            perror("Error writing to temporary file");
+            close(temp_fd);
+            unlink(temp_path);
+            send(client_fd, "ERROR: Could not save file\n", 27, 0);
+            free(buffer);
+            return;
+        }
+        total_received += bytes_received;
+        if (total_received - last_print > 100000000) {
+            printf("Main_Server: Received %lu / %lu bytes (%.0f%%)\n", total_received, file_size, (double)total_received / file_size * 100);
+            fflush(stdout);
+            last_print = total_received;
         }
     }
-    free(buffer);
 
-    // Write new manifest
-    char temp_manifest_path[] = ".git/temp_manifest_XXXXXX";
-    int tm_fd = mkstemp(temp_manifest_path);
-    char manifest_hash[HASH_SIZE + 1] = {0};
-    
-    if (tm_fd != -1) {
-        FILE *tm_file = fdopen(tm_fd, "w");
-        for (int i = 0; i < num_entries; i++) {
-            fprintf(tm_file, "%s %s\n", entries[i].file_name, entries[i].hash);
-        }
-        fclose(tm_file);
+    // Close the temporary file
+    close(temp_fd);
+    printf("Main_Server: Finished receiving %lu bytes. Starting SHA-1 hash...\n", total_received);
+    fflush(stdout);
 
-        compute_sha1(temp_manifest_path, 0, manifest_hash);
+    // Compute SHA1 hash for the received file
+    compute_sha1(temp_path, file_size, hash);
 
-        char mf_dir[256];
-        snprintf(mf_dir, sizeof(mf_dir), ".git/objects/%.2s", manifest_hash);
-        mkdir(mf_dir, 0755);
+    // Create object path using the hash
+    char object_dir[256];
+    snprintf(object_dir, sizeof(object_dir), ".git/objects/%.2s", hash);
+    mkdir(object_dir, 0755);
 
-        char mf_path[256];
-        snprintf(mf_path, sizeof(mf_path), ".git/objects/%.2s/%.38s", manifest_hash, manifest_hash + 2);
-        rename(temp_manifest_path, mf_path);
+    char object_path[256];
+    snprintf(object_path, sizeof(object_path), ".git/objects/%.2s/%.38s", hash, hash + 2);
 
-        write_branch_head(branch, manifest_hash);
+    // Move the temporary file to the object path
+    if (rename(temp_path, object_path) != 0) {
+        perror("Error moving temporary file to object directory");
+        unlink(temp_path); // Remove temporary file
+        send(client_fd, "ERROR: Could not save object file\n", 34, 0);
+        free(buffer);
+        return;
     }
-    pthread_mutex_unlock(&branch_lock);
+
+    // Update the branch head with the new commit hash
+    write_branch_head(branch, hash);
 
     // Send success response
     char response[128];
-    snprintf(response, sizeof(response), "SUCCESS: Push accepted. Branch head is now %s\n", manifest_hash);
+    snprintf(response, sizeof(response), "SUCCESS: File saved as %s, commit hash: %s\n", file_name, hash);
     send(client_fd, response, strlen(response), 0);
+    free(buffer);
 }
 
 
@@ -354,23 +315,43 @@ void handle_history(int client_fd, const char *branch) {
 }
 
 void handle_client(int client_fd) {
-    char header[256];
-    int i = 0;
-    while (i < 255) {
-        if (recv(client_fd, &header[i], 1, 0) <= 0) break;
-        if (header[i] == '\n') break;
-        i++;
+    char *buffer = malloc(BUFFER_SIZE);
+    if (!buffer) {
+        perror("Failed to allocate buffer");
+        close(client_fd);
+        return;
     }
-    header[i] = '\0';
+    ssize_t received = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
+    if (received <= 0) {
+        perror("Error receiving data");
+        free(buffer);
+        close(client_fd);
+        return;
+    }
 
-    char command[16], branch[32], parent_hash[41];
-    int num_files = 0;
+    buffer[received] = '\0';
 
-    sscanf(header, "%s %s %d %s", command, branch, &num_files, parent_hash);
-    
-    if (strcmp(command, "PUSH") == 0) {
-        handle_push(client_fd, branch, num_files, parent_hash);
-    } else if (strcmp(command, "PULL") == 0) {
+	char command[16], branch[32], file_name[128];
+    size_t file_size = 0;
+
+    // Parse command, branch, file name, and file size
+    sscanf(buffer, "%s %s %lu %s", command, branch, &file_size, file_name);
+	
+	if (strcmp(command,"PUSH") == 0) {
+        char *header_end = strchr(buffer, '\n');
+        size_t header_len = 0;
+        char *initial_data = NULL;
+        size_t initial_len = 0;
+        
+        if (header_end) {
+            header_len = (header_end - buffer) + 1;
+            initial_data = header_end + 1;
+            initial_len = received - header_len;
+        }
+
+        handle_push(client_fd, branch, file_name, file_size, initial_data, initial_len);
+	}
+    else if (strcmp(command, "PULL") == 0) {
         handle_pull(client_fd, branch);
     } else if (strcmp(command, "HISTORY") == 0) {
         handle_history(client_fd, branch);
@@ -378,6 +359,7 @@ void handle_client(int client_fd) {
         send(client_fd, "ERROR: Invalid command\n", 23, 0);
     }
 
+    free(buffer);
     close(client_fd);
 }
 
@@ -451,7 +433,6 @@ int main() {
     }
 
     printf("Server started...\n");
-    fflush(stdout);
 
     while (1) {
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);

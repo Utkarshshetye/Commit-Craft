@@ -372,21 +372,10 @@ void git_push_server() {
     if(count==0){
         printf("Working directory clean, no files to push!\n");
     } else {
-        setup(); // Connect once for all files
-
-        char parent_hash[GIT_OID_HEXSZ + 1] = "0000000000000000000000000000000000000000";
-        if (commit) {
-            git_oid_fmt(parent_hash, git_commit_id(commit));
-        }
-
-        // Send atomic push header
-        char header[256];
-        snprintf(header, sizeof(header), "PUSH main %d %s\n", count, parent_hash);
-        send(sockfd, header, strlen(header), 0);
-
         for(int i=0; i<count; i++){
             const git_status_entry * entry = git_status_byindex(status_list, i);
             
+            // Get path whether it's in index or working directory
             const char * path = NULL;
             if (entry->index_to_workdir) {
                 path = entry->index_to_workdir->new_file.path;
@@ -395,7 +384,8 @@ void git_push_server() {
             }
 
             if (path != NULL && entry->status != GIT_STATUS_CURRENT && entry->status != GIT_STATUS_IGNORED) {
-                printf("Pushing file: %s\n", path);
+                printf("Processing file: %s (status: %u)\n", path, entry->status);
+                fflush(stdout);
                 int fd = open(path, O_RDONLY);
                 if (fd < 0) {
                     perror("Failed to open file");
@@ -405,29 +395,38 @@ void git_push_server() {
                 struct stat statbuf;
                 fstat(fd, &statbuf);
                 off_t off = statbuf.st_size;
-
-                // Send 256-byte file header
-                char file_header[256];
-                memset(file_header, 0, 256);
-                snprintf(file_header, 256, "%ld %s", (long)off, path);
-                send(sockfd, file_header, 256, 0);
-
-                off_t bytes_to_send = off;
                 off_t start = 0;
+
+                // Open a new connection for each file since Main_Server closes the socket after one command
+                setup();
+
+                // Send the required network protocol header to Main_Server
+                char header[256];
+                snprintf(header, sizeof(header), "PUSH main %ld %s\n", (long)off, path);
+                send(sockfd, header, strlen(header), 0);
+
+                // Use zero-copy to transfer the file payload robustly in chunks if needed
+                printf("Starting zero-copy sendfile for %ld bytes...\n", (long)off);
+                fflush(stdout);
+                off_t bytes_to_send = off;
                 while (bytes_to_send > 0) {
                     ssize_t sent = sendfile(sockfd, fd, &start, bytes_to_send);
-                    if (sent <= 0) break;
+                    if (sent <= 0) {
+                        perror("sendfile failed");
+                        break;
+                    }
                     bytes_to_send -= sent;
+                    printf("Sent chunk: %ld bytes (remaining: %ld)\n", (long)sent, (long)bytes_to_send);
                 }
+                printf("...Sent %s (%ld bytes) successfully. Waiting for server confirmation...\n", path, (long)off);
+                char srv_resp[256] = {0};
+                recv(sockfd, srv_resp, sizeof(srv_resp)-1, 0);
+                printf("Server replied: %s\n", srv_resp);
+                fflush(stdout);
                 close(fd);
+                close(sockfd);
             }
-        }
-        
-        // Wait for server's success or conflict response
-        char srv_resp[256] = {0};
-        recv(sockfd, srv_resp, sizeof(srv_resp)-1, 0);
-        printf("Server replied: %s\n", srv_resp);
-        close(sockfd);
+        }    
     }
 
     // send(sockfd, msg, strlen(msg), 0);
